@@ -26,11 +26,11 @@
 
 分析了一下RTSP协议消息的基本组成结构：
 
-![image-20241028112050166](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241028112050166.png)
+![image-20241028112050166](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/image-20241028112050166.png)
 
 以及在应用中其需要遵循的消息类型顺序：
 
-![image-20241028112237670](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241028112237670.png)
+![image-20241028112237670](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/image-20241028112237670.png)
 
 然后通过比较输入生成导向的fuzzer与变异导向的fuzzer来证明了选择变异导向的fuzzer的正确性，之后又分析了变异导向fuzzer所面临的挑战：
 
@@ -52,13 +52,13 @@
 
 其中PLAY消息的结构为，其中，某些类型的消息具有特定的标头字段：
 
-![image-20241029110041601](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241029110041601.png)
+![image-20241029110041601](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/image-20241029110041601.png)
 
 为了分析LLM对RTSP提取出的语法，我们随机选定50个LLM对RTSP产生的答案作为一个答案集。
 
 使用LLM对这10种类型生成语法，预计这些消息类型会出现在LLM生成的40多个答案之中，如下：
 
-![image-20241029111132544](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241029111132544.png)
+![image-20241029111132544](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/image-20241029111132544.png)
 
 尽管生成的语法中有两种客户端的随机消息，比如SET DESCRIPTION，但是都只出现了一次
 
@@ -85,7 +85,7 @@
 
 作者为LLM提供了fuzzer与服务器之间的消息交换，并要求LLM给出一个可能造成状态转换的消息。作者给LLM提供了现有的通信记录，这些记录可以使服务器到达每一种状态。
 
-![image-20241030160434103](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241030160434103.png)
+![image-20241030160434103](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/image-20241030160434103.png)
 
 灰色：引起状态转换   橙色：未引起状态转换   蓝色：不合适的消息，直接被服务器端拒绝
 
@@ -93,7 +93,7 @@ LLM生成的客户端请求，69%~89%可以引发状态转移，并覆盖了每�
 
 # LLM指导的协议模糊测试
 
-![图片](https://mmbiz.qpic.cn/mmbiz_png/JchE46RGRlo6If1axsMIkAZ8RoKWFnAgHdGmf3FYVQ1T42ezMoJcRdMftsKTLNicFxG0WqCQaibjPfdFOZA7MkCA/640?wx_fmt=png&from=appmsg&wxfrom=13&tp=wxpic)
+![图片](Large%20Language%20Model%20guided%20Protocol%20Fuzzing.assets/640.png)
 
 这一节主要就是介绍这个LLM引导的模糊测试的算法。灰色部分是本文作者用LLM进行改进的部分：
 

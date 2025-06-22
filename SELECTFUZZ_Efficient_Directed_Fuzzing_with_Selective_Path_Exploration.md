@@ -43,7 +43,7 @@ selectfuzz的大概步骤：
 
 ## relevant code：
 
-![image-20241225101603250](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241225101603250.png)
+![image-20241225101603250](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241225101603250.png)
 
 比如说在这张图中，其实只有14-15行是对触发crash有影响的，前面的2-10都不会直接影响crash触发。也就是说，满足这些判断条件并不能对到达目标位置产生影响，只会浪费energy。但是也不能直接完全的将对于到达目标无关的部分直接归于无关代码，比如5行中对于x的操作，可能会影响crash的exploitation阶段，所以也要将line 5视为相关代码
 
@@ -51,7 +51,7 @@ selectfuzz的大概步骤：
 
 主要问题还是前面提到的浪费了太多energy在探索无关代码，通过上面的listing 1举了个例子：
 
-![image-20241225110252796](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241225110252796.png)
+![image-20241225110252796](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241225110252796.png)
 
 假如种子的执行路径为a->c->e->h，通过种子产生的一批输入M中有一个输入N触发了f或者b，而且其他的输入虽然触发了其他的块，但是由于这些块与最后的目标无关，所以都可以被归为无意义的输入。
 
@@ -68,7 +68,7 @@ selectfuzz的大概步骤：
 
 # SELECTFUZZ
 
-![image-20241225201532721](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241225201532721.png)
+![image-20241225201532721](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241225201532721.png)
 
 selectfuzz引入了一种新的距离评估标准（distance metric），并采用了一种过程间控制流以及数据流分析来识别并选择性的插桩
 
@@ -83,7 +83,7 @@ selectfuzz引入了一种新的距离评估标准（distance metric），并采�
 
 ### Block Distance
 
-![image-20241225203349322](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241225203349322.png)
+![image-20241225203349322](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241225203349322.png)
 
 为基本块设置了三个状态：
 
@@ -111,7 +111,7 @@ Pb:到达的可能性，展示了从基本块b到达目标T的可能性（cal_pr
 
 ### An Example
 
-![image-20241226110352117](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241226110352117.png)
+![image-20241226110352117](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241226110352117.png)
 
 节点a有两个successor，其Pa=(Pb+Pf)/2=0.5,所以d(a,T)=1/Pb=2（其实就是从crash那里反着推回来，以e的Pe=1作为基点，例如c只有e一个successor，所以Pc=Pe/1）
 
@@ -194,7 +194,7 @@ fuzzer对于输入执行的超时设计还是在超过设定的时限后会减�
 
 BBtotal、BBrec 和 BBrel 分别表示程序中基本块的总数、可达基本块的数量和相关基本块的数量，Beacon†表示我们对Beacon原生的路径修剪实现，SELECTFUZZ∗ 表示 SELECTFUZZ 和 Beacon† 的集成
 
-![image-20241227105335832](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241227105335832.png)
+![image-20241227105335832](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241227105335832.png)
 
 由于beacon没有开源也没有公开种子语料库，作者是直接重用的beacon作者论文里的数据
 
@@ -202,7 +202,7 @@ BBtotal、BBrec 和 BBrel 分别表示程序中基本块的总数、可达基本
 
 ## Ablation Study
 
-![image-20241227112229547](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241227112229547.png)
+![image-20241227112229547](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241227112229547.png)
 
 ## Understanding Performance Boost
 
@@ -226,13 +226,13 @@ BBtotal、BBrec 和 BBrel 分别表示程序中基本块的总数、可达基本
 
 使用Google Fuzzer Test Suite (GFTS)
 
-![image-20241227155659271](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241227155659271.png)
+![image-20241227155659271](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241227155659271.png)
 
 selectfuzz不能再另外几个case中超过其他几个fuzzer的主要原因是因为它不能产生高质量的输入来满足复杂的路径约束。而selectfuzz可以兼容这些先进fuzzer用到的诸如路劲裁剪等技术来互补。
 
 ## Detecting New Vulnerabilities
 
-![image-20241227160655487](C:\Users\123\AppData\Roaming\Typora\typora-user-images\image-20241227160655487.png)
+![image-20241227160655487](SELECTFUZZ_Efficient_Directed_Fuzzing_with_Selective_Path_Exploration.assets/image-20241227160655487.png)
 
 # CONCLUSION
 
