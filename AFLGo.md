@@ -247,7 +247,7 @@ export ADDITIONAL="-targets=$TMP_DIR/BBtargets.txt -outdir=$TMP_DIR -flto -fuse-
 
 # 尝试生成中间文件
 
-这里用example中的目标项目尝试生成一下中间的BBname和BBcalls文件来看一下它们的具体内容是什么。
+这里可以用用example中的目标项目尝试生成一下中间的BBname和BBcalls文件来看一下它们的具体内容是什么。
 
 
 
@@ -720,7 +720,7 @@ static volatile char *_B __attribute__((used)) = "##SIG_AFL_PERSIST##";
 
 在传统的AFL forkserver机制中，目标程序是执行一次fuzz就会有一次fork
 
-**persistent模式（持续化模式）：**
+## **persistent模式（持续化模式）：**
 
 通过前面的宏定义的D__AFL_LOOP引入这个操作，在afl-llvm-rt.o这个runtime库中实现它的逻辑。用户只需要在程序中像这样调用一下这个宏就可以使用persistent模式了：
 
@@ -740,7 +740,7 @@ persistent模式的出现实质上是为了更进一步的消解fork进程产生
 
 这其实是对Libfuzzer的一种借鉴和模仿。通俗的说，就是让目标程序在被fork一次之后在这次fork出的进程空间中执行若干次（传统的机制是fork一次就只执行一次）
 
-**deferred模式（forkserver 延迟启动）：**
+## **deferred模式（forkserver 延迟启动）：**
 
 通过前面的宏定义的-D__ AFL_HAVE_MANUAL_CONTROL=1来开启这个模式，然后通过在driver中手动的写入： __AFL_INIT()这个函数来显式的设定forkserver启动的时间。
 
@@ -808,3 +808,519 @@ cc_params[cc_par_cnt++] = alloc_printf("%s/aflgo-runtime.o", obj_path);
 gcc插桩一般是通过在汇编阶段向目标程序的汇编文件中写入插桩逻辑（也是一些汇编代码）来实现。
 
 而llvm的pass则更加便利，它允许我们直接写高级语言来完成插桩逻辑，所以我们可以在运行时库中看到很多原本在afl-as中通过汇编实现的逻辑（诸如__afl_start_forkserver）
+
+所以在这个地方就可以不用硬看汇编代码来理解插桩函数的逻辑，而是可以直接看高级语言编写而成的插桩逻辑：
+
+## __afl_map_shm：
+
+```c
+static void __afl_map_shm(void) {
+
+  u8 *id_str = getenv(SHM_ENV_VAR);
+
+  /* If we're running under AFL, attach to the appropriate region, replacing the
+     early-stage __afl_area_initial region that is needed to allow some really
+     hacky .init code to work correctly in projects such as OpenSSL. */
+
+  if (id_str) {
+
+    u32 shm_id = atoi(id_str);
+
+    __afl_area_ptr = shmat(shm_id, NULL, 0);
+
+    /* Whooooops. */
+
+    if (__afl_area_ptr == (void *)-1) _exit(1);
+
+    /* Write something into the bitmap so that even with low AFL_INST_RATIO,
+       our parent doesn't give up on us. */
+
+    __afl_area_ptr[0] = 1;
+
+  }
+
+}
+```
+
+这个函数是用于初始化shm共享虚拟内存的，最关键的就是这个：
+
+```c
+__afl_area_ptr = shmat(shm_id, NULL, 0);
+```
+
+分配一块共享内存，然后将表示虚拟内存存在的标志位__afl_area_ptr置为1
+
+## __afl_start_forkserver：
+
+```c
+static void __afl_start_forkserver(void) {
+
+  static u8 tmp[4];
+  s32 child_pid;
+
+  u8  child_stopped = 0;
+
+  /* Phone home and tell the parent that we're OK. If parent isn't there,
+     assume we're not running in forkserver mode and just execute program. */
+
+  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+
+  while (1) {
+
+    u32 was_killed;
+    int status;
+
+    /* Wait for parent by reading from the pipe. Abort if read fails. */
+
+    if (read(FORKSRV_FD, &was_killed, 4) != 4) _exit(1);
+
+    /* If we stopped the child in persistent mode, but there was a race
+       condition and afl-fuzz already issued SIGKILL, write off the old
+       process. */
+
+    if (child_stopped && was_killed) {
+      child_stopped = 0;
+      if (waitpid(child_pid, &status, 0) < 0) _exit(1);
+    }
+
+    if (!child_stopped) {
+
+      /* Once woken up, create a clone of our process. */
+
+      child_pid = fork();
+      if (child_pid < 0) _exit(1);
+
+      /* In child process: close fds, resume execution. */
+
+      if (!child_pid) {
+
+        close(FORKSRV_FD);
+        close(FORKSRV_FD + 1);
+        return;
+  
+      }
+
+    } else {
+
+      /* Special handling for persistent mode: if the child is alive but
+         currently stopped, simply restart it with SIGCONT. */
+
+      kill(child_pid, SIGCONT);
+      child_stopped = 0;
+
+    }
+
+    /* In parent process: write PID to pipe, then wait for child. */
+
+    if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) _exit(1);
+
+    if (waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0)
+      _exit(1);
+
+    /* In persistent mode, the child stops itself with SIGSTOP to indicate
+       a successful run. In this case, we want to wake it up without forking
+       again. */
+
+    if (WIFSTOPPED(status)) child_stopped = 1;
+
+    /* Relay wait status to pipe, then loop back. */
+
+    if (write(FORKSRV_FD + 1, &status, 4) != 4) _exit(1);
+
+  }
+
+}
+```
+
+这个函数用于实现具体的forkserver逻辑。首先通过管道给forkserver发送一个四字节的信号，确定父进程存在，然后进入一个循环，通过管道从forkserver处读取开始的信号，如果读取成功则开始正式的fork操作。
+
+在forkserver自检完成后就fork出一个子进程，fork出的子进程关闭与forkserver的通信管道（使程序能够正常运行，防止一些bug的出现），对于父进程则将刚刚fork出的子进程的pid通过通信管道返回给fuzzer后等待子进程执行完毕。
+
+在这个函数中还有一个部分：
+
+```c
+    if (child_stopped && was_killed) {
+      child_stopped = 0;
+      if (waitpid(child_pid, &status, 0) < 0) _exit(1);
+    }
+```
+
+这部分是为了解决竞态条件的问题，在persistent模式下，子进程执行完一次后会自动挂起，并等待下一次的执行，如果fuzzer设置了超时会发出终止信号，那么可能会与forkserver发出的继续信号产生竞态条件，所以这里会判断子进程是不是已经挂起了。如果在处于挂起且又收到了结束信号，那么就将这个子进程关闭。
+
+## __afl_persistent_loop：
+
+这个函数是用于实现persistent模式：
+
+```c
+int __afl_persistent_loop(unsigned int max_cnt) {
+
+  static u8  first_pass = 1;
+  static u32 cycle_cnt;
+
+  if (first_pass) {
+
+    /* Make sure that every iteration of __AFL_LOOP() starts with a clean slate.
+       On subsequent calls, the parent will take care of that, but on the first
+       iteration, it's our job to erase any trace of whatever happened
+       before the loop. */
+
+    if (is_persistent) {
+
+      memset(__afl_area_ptr, 0, MAP_SIZE + 16);
+      __afl_area_ptr[0] = 1;
+      __afl_prev_loc = 0;
+    }
+
+    cycle_cnt  = max_cnt;
+    first_pass = 0;
+    return 1;
+
+  }
+
+  if (is_persistent) {
+
+    if (--cycle_cnt) {
+
+      raise(SIGSTOP);
+
+      __afl_area_ptr[0] = 1;
+      __afl_prev_loc = 0;
+
+      return 1;
+
+    } else {
+
+      /* When exiting __AFL_LOOP(), make sure that the subsequent code that
+         follows the loop is not traced. We do that by pivoting back to the
+         dummy output region. */
+
+      __afl_area_ptr = __afl_area_initial;
+
+    }
+
+  }
+
+  return 0;
+
+}
+```
+
+首先判断进入这个函数执行的子进程是不是处于AFL_LOOP（persistent的循环次数）的第一次执行，如果是第一次执行那么要对存储AFL覆盖率的缓冲区进行清空，防止之前执行在其中残留有数据。然后将循环次数设定为用户指定的循环次数后就进入正常执行。
+
+后面就是每次执行完成后主动发出一个SIGSTOP的挂起信号，在循环次数完结之后为了防止__afl_area_ptr指向的共享内存区域继续记录循环体之外代码的覆盖率，会将其指向一个dummy output region。
+
+## __afl_manual_init：
+
+```c
+void __afl_manual_init(void) {
+
+  static u8 init_done;
+
+  if (!init_done) {
+
+    __afl_map_shm();
+    __afl_start_forkserver();
+    init_done = 1;
+
+  }
+
+}
+```
+
+这个函数是在deferred模式下用户选择手动启动forkserver时使用的，其实就是包装了初始化共享内存和启动forkserver的函数
+
+## __afl_auto_init：
+
+```c
+/* Proper initialization routine. */
+
+__attribute__((constructor(CONST_PRIO))) void __afl_auto_init(void) {
+
+  is_persistent = !!getenv(PERSIST_ENV_VAR);
+
+  if (getenv(DEFER_ENV_VAR)) return;
+
+  __afl_manual_init();
+
+}
+```
+
+这个函数就是正常模式下AFL自动化初始入口函数操作。如果设置了deferred模式，则不按照正常的初始化进行
+
+*tips：这里用到了一个GNU C中的独有关键字attribute，它使用constructor参数时指定这个函数的执行优先级，这里设置为CONST_PRIO，也就是先于main函数之前执行。*
+
+## SanitizerCoverage：
+
+在LLVM中提供了一种更先进的插桩方式：Sanitizer Coverage，这个方法比传统的afl的插桩模式更简单也更精确。
+
+当使用的-fsanitize-coverage=trace-pc-guard选项编译目标时，LLVM会自动的向其中的每条边插入一个结构：
+
+```c
+static uint32_t guard_var;
+__sanitizer_cov_trace_pc_guard(&guard_var);
+```
+
+这个__sanitizer_cov_trace_pc_guard就对应这个回调函数：
+
+```c
+void __sanitizer_cov_trace_pc_guard(uint32_t* guard) {
+  __afl_area_ptr[*guard]++;
+}
+```
+
+在每次执行到插桩点时就会执行这个函数，它的逻辑非常简单，就是将guard作为索引增加这条边的hit数
+
+然后是__sanitizer_cov_trace_pc_guard_init这个函数，它在程序开始执行时调用一次：
+
+```c
+void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
+
+  u32 inst_ratio = 100;
+  u8* x;
+
+  if (start == stop || *start) return;
+
+  x = getenv("AFL_INST_RATIO");
+  if (x) inst_ratio = atoi(x);
+
+  if (!inst_ratio || inst_ratio > 100) {
+    fprintf(stderr, "[-] ERROR: Invalid AFL_INST_RATIO (must be 1-100).\n");
+    abort();
+  }
+
+  /* Make sure that the first element in the range is always set - we use that
+     to avoid duplicate calls (which can happen as an artifact of the underlying
+     implementation in LLVM). */
+
+  *(start++) = R(MAP_SIZE - 1) + 1;
+
+  while (start < stop) {
+
+    if (R(100) < inst_ratio) *start = R(MAP_SIZE - 1) + 1;
+    else *start = 0;
+
+    start++;
+
+  }
+
+}
+```
+
+首先判断start和stop是不是同一个位置防止重复初始化，然后通过环境变量设置插桩率（默认为100%全部插桩）
+
+然后就是初始化所有边的ID：
+
+```c
+while (start < stop) {
+  if (R(100) < inst_ratio)
+    *start = R(MAP_SIZE - 1) + 1;
+  else
+    *start = 0;
+  start++;
+}
+```
+
+给每个边分配一个1~MAP_SIZE 的随机 ID，R(...)是个宏，表示取这个范围内的一个随机数，如果此处不插桩，则将其这里的ID置为0。
+
+## AFLGO_TRACING
+
+这一部分通过一个宏定义判断来决定是否需要执行，这些函数是用于aflgo在静态分析阶段记录基本块和这些基本块之间的距离。
+
+### hashset族函数：
+
+在这一部分有很多hashset开头的函数，这些函数主要是实现哈希集合数据结构。
+
+首先是hashset_create函数，它用于实例化一个hashset结构体：
+
+```c
+    struct hashset_st {
+        size_t nbits;
+        size_t mask;
+
+        size_t capacity;
+        size_t *items;
+        size_t nitems;
+        size_t n_deleted_items;
+    };
+
+    typedef struct hashset_st *hashset_t;
+```
+
+hashset_num_items函数用于返回哈希集合中有多少个成员。
+
+hashset_destroy函数用于销毁哈希集合并释放内存。
+
+hashset_add_member函数用于向哈希集合中添加新成员。
+
+maybe_rehash函数检查当前哈希集合的负载率，如果超过85%，则对其进行扩容。
+
+hashset_add函数就是hashset_add_member与maybe_rehash的封装。
+
+hashset_remove函数用于移除哈希集合中的一个成员。
+
+hashset_is_member函数用于检查一个成员是否在哈希集合中。
+
+### llvm_profiling_call：
+
+这是最主要的记录逻辑：
+
+```c
+void llvm_profiling_call(const char* bbname)
+	__attribute__((visibility("default")));
+
+void llvm_profiling_call(const char* bbname) {
+    if (filefd != NULL) {
+        writeBB(bbname);
+    } else if (getenv("AFLGO_PROFILER_FILE")) {
+        filefd = fopen(getenv("AFLGO_PROFILER_FILE"), "a+");
+        if (filefd != NULL) {
+            strcpy(edgeStr, "START");
+            edgeSet = hashset_create();
+            fprintf(filefd, "--------------------------\n");
+            writeBB(bbname);
+        }
+    }
+}
+```
+
+首先判断是否打开了记录文件的描述符，没有的话就从AFLGO_PROFILER_FILE这个环境变量中获取，之后给edgeStr初始化一个START字符串并用实例化一个哈希集合。
+
+然后执行writeBB函数记录基本块。
+
+### writeBB：
+
+这个函数是实际向文件中记录执行过的基本块名称：
+
+```c
+inline __attribute__((always_inline))
+void writeBB(const char* bbname) {
+    strcat(edgeStr, bbname);
+    size_t cksum=(size_t)hash32(bbname, strlen(edgeStr), 0xa5b35705);
+    if(!hashset_is_member(edgeSet,(void*)cksum)) {
+        fprintf(filefd, "[BB]: %s\n", bbname);
+        hashset_add(edgeSet, (void*)cksum);
+    }
+    strcpy(edgeStr, bbname);
+    fflush(filefd);
+}
+```
+
+首先将传入的BB名称拼接到全局变量edgeStr中（也就是前面说到的初始化了一个START字符串的那个），形成一个路径上下文（例如：STARTmain），然后将BB名称与这个路径上下文做一次哈希 ：
+
+```c
+size_t cksum=(size_t)hash32(bbname, strlen(edgeStr), 0xa5b35705);
+```
+
+判断这个成员是否已经存在于哈希集合中，如果没有则加入到哈希集合中（进行去重，防止多次记录），并将这个基本块的名称以如下形式记录到文件中：
+
+```
+[BB]:main
+```
+
+然后重置edgeStr变量使其中只有
+
+当前的这个BB名称（最开始是START现在就是main了）
+
+# aflgo-pass.so.cc
+
+## 设置所需参数：
+
+首先是对于pass需要的一些参数进行设置：
+
+```c++
+cl::opt<std::string> DistanceFile(
+    "distance",
+    cl::desc("Distance file containing the distance of each basic block to the provided targets."),
+    cl::value_desc("filename")
+);
+
+cl::opt<std::string> TargetsFile(
+    "targets",
+    cl::desc("Input file containing the target lines of code."),
+    cl::value_desc("targets"));
+
+cl::opt<std::string> OutDirectory(
+    "outdir",
+    cl::desc("Output directory where Ftargets.txt, Fnames.txt, and BBnames.txt are generated."),
+    cl::value_desc("outdir"));
+```
+
+这里的cl是llvm命名空间中的`llvm::cl` 的简写，给pass自定义`-targets`、`-distance`、`-outdir` 这几个选项。
+
+可以看到这个pass需要输入一个包含了各个基本块到目标位置距离的文件、一个包含了目标程序中需要定向到目标位置在代码中的行号的文件、一个接受输出文件的路径。
+
+## 特化DOT模板
+
+LLVM的pass中提供了一个用于生成DOT文件的基类：DefaultDOTGraphTraits
+
+aflgo生成DOT文件的逻辑就是从这个基类中进行一定的修改：
+
+```c++
+namespace llvm {
+
+template<>
+struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
+  DOTGraphTraits(bool isSimple=true) : DefaultDOTGraphTraits(isSimple) {}
+
+  static std::string getGraphName(Function *F) {
+    return "CFG for '" + F->getName().str() + "' function";
+  }
+
+   std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
+    if (!Node->getName().empty()) {
+      return Node->getName().str();
+    }
+
+    std::string Str;
+    raw_string_ostream OS(Str); //raw_string_ostream是LLVM中的流封装，用于写入字符串缓冲区。
+
+    Node->printAsOperand(OS, false);
+    return OS.str();
+  }
+};
+
+} 
+```
+
+首先是调用基类中的构造函数进行初始化，这里将isSimple默认设置为true
+
+其中getGraphName是设置生成的DOT文件的图名，这里的命名规则就是：
+
+```
+"CFG for '" + F->getName().str() + "' function"
+```
+
+F->getName().str()就是获取当前函数的名称，返回值类似于`CFG for 'main' function`
+
+之后的getNodeLabel就是设置图中节点（也就是每个基本块）的标签，如果这个基本块有名字，则直接将它的名字作为标签，如果没有，则打印该基本块的“操作数格式名”作为标签。
+
+## AFLCoverage
+
+之后再一个匿名命名空间中定义了一个AFLCoverage类：
+
+```c++
+namespace {
+
+  class AFLCoverage : public ModulePass {
+
+    public:
+
+      static char ID;
+      AFLCoverage() : ModulePass(ID) { }
+
+      bool runOnModule(Module &M) override;
+
+      // StringRef getPassName() const override {
+      //  return "American Fuzzy Lop Instrumentation";
+      // }
+
+  };
+
+}
+```
+
+这其实是一个模块级别（Module-level）Pass，它继承自ModulePass
+
+对于这个成员ID，LLVM 的 `Pass` 系统要求每个 Pass 都有一个唯一的 `ID`，通过这个 ID 实现注册与识别。
+
+调用父类的构造函数将
