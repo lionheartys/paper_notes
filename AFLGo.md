@@ -1323,4 +1323,797 @@ namespace {
 
 对于这个成员ID，LLVM 的 `Pass` 系统要求每个 Pass 都有一个唯一的 `ID`，通过这个 ID 实现注册与识别。
 
-调用父类的构造函数将
+调用父类的构造函数作为本身的构造函数。
+
+runOnModule是pass的主入口，一般就是这个模块pass的核心逻辑，它在被pass manager调用时被执行，在这个pass中它的真实实现在后面会看到。
+
+## getDebugLoc
+
+这个函数与获取目标编译过程中产生的debug信息有关，主要功能是提取当前IR指令在源码中的对应行号位置
+
+```c++
+static void getDebugLoc(const Instruction *I, std::string &Filename,
+                        unsigned &Line) {
+#ifdef LLVM_OLD_DEBUG_API
+  DebugLoc Loc = I->getDebugLoc();
+  if (!Loc.isUnknown()) {
+    DILocation cDILoc(Loc.getAsMDNode(M.getContext()));
+    DILocation oDILoc = cDILoc.getOrigLocation();
+
+    Line = oDILoc.getLineNumber();
+    Filename = oDILoc.getFilename().str();
+
+    if (filename.empty()) {
+      Line = cDILoc.getLineNumber();
+      Filename = cDILoc.getFilename().str();
+    }
+  }
+#else
+  if (DILocation *Loc = I->getDebugLoc()) {
+    Line = Loc->getLine();
+    Filename = Loc->getFilename().str();
+
+    if (Filename.empty()) {
+      DILocation *oDILoc = Loc->getInlinedAt();
+      if (oDILoc) {
+        Line = oDILoc->getLine();
+        Filename = oDILoc->getFilename().str();
+      }
+    }
+  }
+#endif /* LLVM_OLD_DEBUG_API */
+}
+```
+
+前面ifdef中包裹的部分不用细究，这个是为了兼容老版本LLVM。主要的处理逻辑是首先通过DILocation *Loc = I->getDebugLoc()来尝试获取该条IR处的调试信息（如果有的话）提取出调试信息中的IR映射到源代码中的行号以及文件名（getLine和getFilename）
+
+在对于没有提取到filename的情况，尝试获取getInlinedAt（这是一种经典情况，由于编译优化无法使内联函数等丢失调试信息）
+
+## AFLCoverage::runOnModule
+
+这是对前面namespace中AFLCoverage类中pass主入口函数runOnModule的重载具体实现，也是这个源文件中代码的主要部分。
+
+首先是一些参数的校验与准备
+
+```c++
+  bool is_aflgo = false;
+  bool is_aflgo_preprocessing = false;
+
+  if (!TargetsFile.empty() && !DistanceFile.empty()) {
+    FATAL("Cannot specify both '-targets' and '-distance'!");
+    return false;
+  }
+
+  std::list<std::string> targets;
+  std::map<std::string, int> bb_to_dis;
+  std::vector<std::string> basic_blocks;
+
+  if (!TargetsFile.empty()) {
+
+    if (OutDirectory.empty()) {
+      FATAL("Provide output directory '-outdir <directory>'");
+      return false;
+    }
+
+    std::ifstream targetsfile(TargetsFile);
+    std::string line;
+    while (std::getline(targetsfile, line))
+      targets.push_back(line);
+    targetsfile.close();
+
+    is_aflgo_preprocessing = true;
+
+  } else if (!DistanceFile.empty()) {
+
+    std::ifstream cf(DistanceFile);
+    if (cf.is_open()) {
+
+      std::string line;
+      while (getline(cf, line)) {
+
+        std::size_t pos = line.find(",");
+        std::string bb_name = line.substr(0, pos);
+        int bb_dis = (int) (100.0 * atof(line.substr(pos + 1, line.length()).c_str()));
+
+        bb_to_dis.emplace(bb_name, bb_dis);
+        basic_blocks.push_back(bb_name);
+
+      }
+      cf.close();
+
+      is_aflgo = true;
+
+    } else {
+      FATAL("Unable to find %s.", DistanceFile.c_str());
+      return false;
+    }
+
+  }
+
+```
+
+首先检查TargetsFile和DistanceFile以及OutDirectory这几个前面设置的命令行参数有没有正确传入对应的数据，并根据Targets和Distance参数的传入判断当前处于aflgo的模糊测试阶段还是预处理阶段（**这两个参数分别属于两个阶段的处理，不能并存**）。
+
+之后定义了list(列表) map（哈希表） vector（向量）三个数据结构分别对应了目标、基本块到目标块距离、所有的基本块这几个关键的对象。
+
+如果传入了target文件，打开targetsfile的文件流，将里面的目标位置信息读取到创建好的targets（list）对象中，设置is_aflgo_preprocessing为true，说明当前处于预处理阶段。
+
+如果传入了distance文件，则与之前相同的，打开文件流，提取出其中基本块到目标位置的距离，按照一定的规则对内容进行划分。将距离值x100处理为int型（方便比较），将距离值与基本块名形成映射后放入前面设置的哈希表中，在这个过程中将基本块的名称同时存入vector。最后将is_aflgo设置为true，说明当前处于aflgo的距离插桩阶段。
+
+```c++
+  char be_quiet = 0;
+
+  if (isatty(2) && !getenv("AFL_QUIET")) {
+
+    if (is_aflgo || is_aflgo_preprocessing)
+      SAYF(cCYA "aflgo-llvm-pass (yeah!) " cBRI VERSION cRST " (%s mode)\n",
+           (is_aflgo_preprocessing ? "preprocessing" : "distance instrumentation"));
+    else
+      SAYF(cCYA "afl-llvm-pass " cBRI VERSION cRST " by <lszekeres@google.com>\n");
+
+
+  } else be_quiet = 1;
+```
+
+这个部分首先判断有没有设置AFL_QUIET（安静模式）环境变量，来决定是否输出一些相应的banner
+
+```c++
+  /* Decide instrumentation ratio */
+
+  char* inst_ratio_str = getenv("AFL_INST_RATIO");
+  unsigned int inst_ratio = 100;
+
+  if (inst_ratio_str) {
+
+    if (sscanf(inst_ratio_str, "%u", &inst_ratio) != 1 || !inst_ratio ||
+        inst_ratio > 100)
+      FATAL("Bad value of AFL_INST_RATIO (must be between 1 and 100)");
+
+  }
+
+  /* Default: Not selective */
+  char* is_selective_str = getenv("AFLGO_SELECTIVE");
+  unsigned int is_selective = 0;
+
+  if (is_selective_str && sscanf(is_selective_str, "%u", &is_selective) != 1)
+    FATAL("Bad value of AFLGO_SELECTIVE (must be 0 or 1)");
+
+  char* dinst_ratio_str = getenv("AFLGO_INST_RATIO");
+  unsigned int dinst_ratio = 100;
+
+  if (dinst_ratio_str) {
+
+    if (sscanf(dinst_ratio_str, "%u", &dinst_ratio) != 1 || !dinst_ratio ||
+        dinst_ratio > 100)
+      FATAL("Bad value of AFLGO_INST_RATIO (must be between 1 and 100)");
+
+  }
+```
+
+这个部分完成了插桩率的设置以及判断是否开启选择性插桩。
+
+首先检查是否设置了AFL_INST_RATIO这个环境变量，这个环境变量是设置相应插桩率（也就是插桩部分的比率，一般都是默认的100）。
+
+然后检查了AFLGO_SELECTIVE以及AFLGO_INST_RATIO这两个环境变量的设置，分别对应是否开启选择性插桩以及aflgo模式下的插桩率。
+
+### 预处理阶段
+
+这是aflgo预处理的实现逻辑，也就是由前面是否传入目标位置文件（targetfiles）决定是否进入这块操作。
+
+```c++
+  /* Instrument all the things! */
+
+  int inst_blocks = 0;
+
+  if (is_aflgo_preprocessing) {
+
+    std::ofstream bbnames(OutDirectory + "/BBnames.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream bbcalls(OutDirectory + "/BBcalls.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream fnames(OutDirectory + "/Fnames.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream ftargets(OutDirectory + "/Ftargets.txt", std::ofstream::out | std::ofstream::app);
+
+    /* Create dot-files directory */
+    std::string dotfiles(OutDirectory + "/dot-files");
+    if (sys::fs::create_directory(dotfiles)) {
+      FATAL("Could not create directory %s.", dotfiles.c_str());
+    }
+
+    for (auto &F : M) {
+
+      bool has_BBs = false;
+      std::string funcName = F.getName().str();
+
+      /* Black list of function names */
+      if (isBlacklisted(&F)) {
+        continue;
+      }
+
+      bool is_target = false;
+      for (auto &BB : F) {
+
+        std::string bb_name("");
+        std::string filename;
+        unsigned line;
+
+        for (auto &I : BB) {
+          getDebugLoc(&I, filename, line);
+
+          /* Don't worry about external libs */
+          static const std::string Xlibs("/usr/");
+          if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+            continue;
+
+          std::size_t found = filename.find_last_of("/\\");
+          if (found != std::string::npos)
+            filename = filename.substr(found + 1);
+
+          if (bb_name.empty()) 
+            bb_name = filename + ":" + std::to_string(line);
+          
+          if (!is_target) {
+            for (auto &target : targets) {
+              std::size_t found = target.find_last_of("/\\");
+              if (found != std::string::npos)
+                target = target.substr(found + 1);
+
+              std::size_t pos = target.find_last_of(":");
+              std::string target_file = target.substr(0, pos);
+              unsigned int target_line = atoi(target.substr(pos + 1).c_str());
+
+              if (!target_file.compare(filename) && target_line == line)
+                is_target = true;
+
+            }
+          }
+
+          if (auto *c = dyn_cast<CallInst>(&I)) {
+
+            std::size_t found = filename.find_last_of("/\\");
+            if (found != std::string::npos)
+              filename = filename.substr(found + 1);
+
+            if (auto *CalledF = c->getCalledFunction()) {
+              if (!isBlacklisted(CalledF))
+                bbcalls << bb_name << "," << CalledF->getName().str() << "\n";
+            }
+          }
+        }
+
+        if (!bb_name.empty()) {
+
+          BB.setName(bb_name + ":");
+          if (!BB.hasName()) {
+            std::string newname = bb_name + ":";
+            Twine t(newname);
+            SmallString<256> NameData;
+            StringRef NameRef = t.toStringRef(NameData);
+            MallocAllocator Allocator;
+            BB.setValueName(ValueName::Create(NameRef, Allocator));
+          }
+
+          bbnames << BB.getName().str() << "\n";
+          has_BBs = true;
+
+#ifdef AFLGO_TRACING
+          auto *TI = BB.getTerminator();
+          IRBuilder<> Builder(TI);
+
+          Value *bbnameVal = Builder.CreateGlobalStringPtr(bb_name);
+          Type *Args[] = {
+              Type::getInt8PtrTy(M.getContext()) //uint8_t* bb_name
+          };
+          FunctionType *FTy = FunctionType::get(Type::getVoidTy(M.getContext()), Args, false);
+          Constant *instrumented = M.getOrInsertFunction("llvm_profiling_call", FTy);
+          Builder.CreateCall(instrumented, {bbnameVal});
+#endif
+
+        }
+      }
+
+      if (has_BBs) {
+        /* Print CFG */
+        std::string cfgFileName = dotfiles + "/cfg." + funcName + ".dot";
+        std::error_code EC;
+        raw_fd_ostream cfgFile(cfgFileName, EC, sys::fs::F_None);
+        if (!EC) {
+          WriteGraph(cfgFile, &F, true);
+        }
+
+        if (is_target)
+          ftargets << F.getName().str() << "\n";
+        fnames << F.getName().str() << "\n";
+      }
+    }
+
+  }
+```
+
+首先根据传入的OutDirectory参数打开BBnames.txt BBcalls.txt Fnames.txt Ftargets.txt这几个记录信息的文件。
+
+同时创建一个用于存储dotfiles文件的临时目录：
+
+```
+std::string dotfiles(OutDirectory + "/dot-files");
+```
+
+遍历模块中的所有函数：
+
+```
+for (auto &F : M)
+```
+
+获取这些函数的名称（如果有的话），并跳过之前设置的黑名单中的函数。
+
+然后对于每个函数，遍历其中所有的基本块：
+
+```
+ for (auto &BB : F) 
+```
+
+对于每个基本块再遍历其中的每一条IR指令：
+
+```
+for (auto &I : BB)
+```
+
+*tips：	这里获取基本块及IR指令的方法都是使用LLVM来自动完成，这也是现在fuzz插桩多用LLVM而不是从汇编中直接插入代码的原因之一*
+
+前面分析过了有一个getDebugLoc函数用于获取每条IR指令所在源码的行数和文件名，也就是用在这里。
+
+在获取了每条IR指令对应的文件名和所在行号之后，根据文件名的开头是否存在`/usr/`来判断是否是用户的系统库代码，如果是的话则跳过。
+
+对于前面没有成功获取到基本块名的那些基本块，在这里将获取到的指令所在文件名进行处理后（去除路径信息只保留文件名）加上行号作为这个基本块的名称：
+
+```
+bb_name = filename + ":" + std::to_string(line);
+```
+
+之后将获取到的文件名和行号与用户传入的目标文件中的目标文件和目标行号进行比对判断该指令是否处于基本块内，如果是的话则将is_target设置为true。
+
+然后判断当前指令是不是一个函数调用指令：
+
+```
+auto *c = dyn_cast<CallInst>(&I)
+```
+
+其中的dyn_cast是LLVM中独有的实现”向下类型转换“的机制，I 原本是Instruction类，而CallInst是继承了Instruction的一个子类，这个机制就是尝试将 I 从Instruction类转换为CallInst类，如果转换成功，那么就会将转换后指向CallInst类的指针返回给auto *c
+
+```
+            if (auto *CalledF = c->getCalledFunction()) {
+              if (!isBlacklisted(CalledF))
+                bbcalls << bb_name << "," << CalledF->getName().str() << "\n";
+            }
+```
+
+在转换成功的情况下（也就是这条指令确实是一条函数调用的指令），那么会获取这个调用指令要调用的那个函数的名称，并将这个调用关系存入BBcalls.txt这个文件中。
+
+之后判断当前基本块是否有名称，如果有名字的话，则首先尝试使用setName给当前正在处理的这个BB（BasicBlock）对象进行命名
+
+```
+BB.setName(bb_name + ":");
+```
+
+如果失败了，那么就尝试使用更底层的方式来给其命名：
+
+```
+          if (!BB.hasName()) {
+            std::string newname = bb_name + ":";
+            Twine t(newname);
+            SmallString<256> NameData;
+            StringRef NameRef = t.toStringRef(NameData);
+            MallocAllocator Allocator;
+            BB.setValueName(ValueName::Create(NameRef, Allocator));
+          }
+```
+
+这里的Twine 是LLVM提供的一种高效字符串处理和表示方式，SmallString是一种LLVM提供的轻型的字符串对象，StringRef 则是LLVM提供的一种轻型的字符串引用对象（只包含指向字符串的指针以及字符串的长度），MallocAllocator则是LLVM提供的内存分配接口，setValueName则可以看作是setName的一种更加底层的实现。
+
+这个部分总的来说其实就是设置当前基本块的名称，并将这个名称保存进BBnames.txt文件中。
+
+接下来如果当前处于aflgo的tracing模式的话，则向每个基本块的末尾进行一次插桩：
+
+```c++
+          auto *TI = BB.getTerminator();
+          IRBuilder<> Builder(TI);
+
+          Value *bbnameVal = Builder.CreateGlobalStringPtr(bb_name);
+          Type *Args[] = {
+              Type::getInt8PtrTy(M.getContext()) //uint8_t* bb_name
+          };
+          FunctionType *FTy = FunctionType::get(Type::getVoidTy(M.getContext()), Args, false);
+          Constant *instrumented = M.getOrInsertFunction("llvm_profiling_call", FTy);
+          Builder.CreateCall(instrumented, {bbnameVal});
+```
+
+getTerminator获取基本块的终止指令，创建一个IRBuilder对象，这是LLVM提供的通过编程方法对IR进行操作的一个便捷方法，它允许用户以编程的方法向ll文件中插入IR指令。
+
+然后通过getInt8PtrTy返回一个代表i8（8位整数指针类型，在 C/C++ 中通常对应 `char*` 或 `uint8_t*`）的llvm::Type对象，并将其存储在一个Type *Args[] 的数组之中，这个数组是一个用于存储函数参数类型的数组（也就是后面要插入的函数所需要的参数的类型）
+
+FunctionType则是用于创建或获取一个函数的类型，**`Type::getVoidTy(M.getContext())`**: 指定函数的**返回类型**为 `void`，**`false`**: 一个布尔值，表示该函数**不是一个可变参数函数**（即没有 `...`）。
+
+M.getOrInsertFunction("llvm_profiling_call", FTy)则是获取一个函数的引用，如果不存在则插入其声明，这里其实就是获取需要插入的目标函数llvm_profiling_call的函数引用。
+
+Builder.CreateCall(instrumented, {bbnameVal});则是实际的将这个调用llvm_profiling_call的指令插入到了基本块的末尾， {bbnameVal}是一个初始化列表，它作唯一参数传递给这个llvm_profiling_call函数，这里也对应了前面Type *Args[] 中的定义。
+
+如果对于当前正在遍历的这个函数其中是存在由名称的基本块，则使用 LLVM 提供的 `WriteGraph` 函数，为每个函数输出 `.dot` 格式的控制流图。
+
+如果这个基本块是目标基本块，则将这个基本块的名称输入到ftargets.txt之中，其他的基本块所在的函数则输入到fnames.txt这个文件之中。
+
+### 距离插桩阶段
+
+这即是由是否传入distance文件决定是否进入距离插桩的逻辑：
+
+```c++
+else {
+    /* Distance instrumentation */
+
+    LLVMContext &C = M.getContext();
+    IntegerType *Int8Ty  = IntegerType::getInt8Ty(C);
+    IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
+    IntegerType *Int64Ty = IntegerType::getInt64Ty(C);
+
+#ifdef __x86_64__
+    IntegerType *LargestType = Int64Ty;
+    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 8);
+#else
+    IntegerType *LargestType = Int32Ty;
+    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 4);
+#endif
+    ConstantInt *MapDistLoc = ConstantInt::get(LargestType, MAP_SIZE);
+    ConstantInt *One = ConstantInt::get(LargestType, 1);
+
+    /* Get globals for the SHM region and the previous location. Note that
+       __afl_prev_loc is thread-local. */
+
+    GlobalVariable *AFLMapPtr =
+        new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
+                           GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
+
+    GlobalVariable *AFLPrevLoc = new GlobalVariable(
+        M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
+        0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
+
+    for (auto &F : M) {
+
+      int distance = -1;
+
+      for (auto &BB : F) {
+
+        distance = -1;
+
+        if (is_aflgo) {
+
+          std::string bb_name;
+          for (auto &I : BB) {
+            std::string filename;
+            unsigned line;
+            getDebugLoc(&I, filename, line);
+
+            if (filename.empty() || line == 0)
+              continue;
+            std::size_t found = filename.find_last_of("/\\");
+            if (found != std::string::npos)
+              filename = filename.substr(found + 1);
+
+            bb_name = filename + ":" + std::to_string(line);
+            break;
+          }
+
+          if (!bb_name.empty()) {
+
+            if (find(basic_blocks.begin(), basic_blocks.end(), bb_name) == basic_blocks.end()) {
+
+              if (is_selective)
+                continue;
+
+            } else {
+
+              /* Find distance for BB */
+
+              if (AFL_R(100) < dinst_ratio) {
+                std::map<std::string,int>::iterator it;
+                for (it = bb_to_dis.begin(); it != bb_to_dis.end(); ++it)
+                  if (it->first.compare(bb_name) == 0)
+                    distance = it->second;
+
+              }
+            }
+          }
+        }
+
+        BasicBlock::iterator IP = BB.getFirstInsertionPt();
+        IRBuilder<> IRB(&(*IP));
+
+        if (AFL_R(100) >= inst_ratio) continue;
+
+        /* Make up cur_loc */
+
+        unsigned int cur_loc = AFL_R(MAP_SIZE);
+
+        ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
+
+        /* Load prev_loc */
+
+        LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
+        PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
+
+        /* Load SHM pointer */
+
+        LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
+        MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *MapPtrIdx =
+            IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+
+        /* Update bitmap */
+
+        LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
+        Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+        IRB.CreateStore(Incr, MapPtrIdx)
+           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+        /* Set prev_loc to cur_loc >> 1 */
+
+        StoreInst *Store =
+            IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
+        Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+        if (distance >= 0) {
+
+          ConstantInt *Distance =
+              ConstantInt::get(LargestType, (unsigned) distance);
+
+          /* Add distance to shm[MAPSIZE] */
+
+          Value *MapDistPtr = IRB.CreateBitCast(
+              IRB.CreateGEP(MapPtr, MapDistLoc), LargestType->getPointerTo());
+          LoadInst *MapDist = IRB.CreateLoad(MapDistPtr);
+          MapDist->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          Value *IncrDist = IRB.CreateAdd(MapDist, Distance);
+          IRB.CreateStore(IncrDist, MapDistPtr)
+              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          /* Increase count at shm[MAPSIZE + (4 or 8)] */
+
+          Value *MapCntPtr = IRB.CreateBitCast(
+              IRB.CreateGEP(MapPtr, MapCntLoc), LargestType->getPointerTo());
+          LoadInst *MapCnt = IRB.CreateLoad(MapCntPtr);
+          MapCnt->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          Value *IncrCnt = IRB.CreateAdd(MapCnt, One);
+          IRB.CreateStore(IncrCnt, MapCntPtr)
+              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+        }
+
+        inst_blocks++;
+
+      }
+    }
+  }
+```
+
+首先是定义了一部分LLVM IR中会使用到的数据类型，用于后续的指令构造
+
+`Int8Ty`：1 字节，用于 bitmap；
+
+`Int32Ty`：用于 cur_loc、prev_loc 等；
+
+`Int64Ty`：在 x86_64 平台用于 distance 统计。
+
+然后根据是否是64位平台定义了两个变量：LargestType、MapCntLoc，这两个变量的具体作用在后面再分析。
+
+之后又有两个与前面相似的变量：MapDistLoc、One
+
+AFLMapPtr与AFLPrevLoc则分别对应了传统插桩中afl_area_ptr以及__afl_prev_loc这两个全局变量，以afl_area_ptr为例：
+
+```c++
+    GlobalVariable *AFLMapPtr =
+        new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
+                           GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
+```
+
+这里使用new 创建分配了一个GlobalVariable类的指针对象，设定这个全局变量的类型是Int8Ty（也就是uint8），非常量（其值可变，false的含义），并作为一个外部可见符号（GlobalValue::ExternalLinkage），初始值为0， 名字为__afl_area_ptr
+
+*tips：这里创建初始化的这个内存空间在被编译的目标程序运行时可以在自己的进程空间内访问*
+
+在完成需要用到的变量初始化之后，进入了一个对于每个函数以及其中基本块处理的嵌套循环：
+
+首先是遍历模块中的每个函数，现将距离值distance初始化为-1，然后遍历该函数中的每个基本块。
+
+进入对基本块的处理循环中，有一个对is_aflgo标志位的判断，但是我认为这里应该是一个冗余判断，进入这个处理的逻辑条件就是is_aflgo为true
+
+对于每个基本块中的每条IR指令进行遍历，使用前面定义的getDebugLoc函数获取每条指令所处的文件以及在源文件中的行号，对于文件名为空或者行号为0的指令则跳过处理。对有文件名字的进行处理，去除文件名中的文件路径，并将其作为这个基本块的名字（bb_name）使用。
+
+对于成功获取到bb_name的基本块，首先判断这个基本块名有没有存在于用户传入BBnames.txt文件中（也就是有没存在有在aflgo预处理阶段遍历到的基本块）
+
+如果该基本块不在文件中且现在是选择插桩模式（is_selective），则跳出对于该基本块的处理：
+
+```c++
+            if (find(basic_blocks.begin(), basic_blocks.end(), bb_name) == basic_blocks.end()) {
+
+              if (is_selective)
+                continue;
+
+            } 
+```
+
+如果在提供的文件中找到了这个对应的基本块，那么则对距离对象进行遍历获取该基本块到目标位置的距离：
+
+```c++
+                std::map<std::string,int>::iterator it;
+                for (it = bb_to_dis.begin(); it != bb_to_dis.end(); ++it)
+                  if (it->first.compare(bb_name) == 0)
+                    distance = it->second;
+
+              }
+```
+
+也就是通过将哈希表结构中每个键值对的键（对应基本块名称）取出与当前遍历到的基本块名称做对比，如果比对成功则将值赋给distance
+
+*tips：这里的first是对应哈希表键值对中键，second是对应键值对中的值*
+
+在准备好需要使用到的数据后，下面就进入了正式的插桩操作：
+
+首先通过getFirstInsertionPt函数获取这个基本块的在phi指令后的第一个指令起始的位置（传统的插桩位置），选中 BB 的第一个插入点，使用 IRBuilder 来创建 IR 指令。
+
+接下来的一部分的代码其实就是传统AFL的插桩逻辑：
+
+```c++
+		unsigned int cur_loc = AFL_R(MAP_SIZE);
+
+        ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
+
+        /* Load prev_loc */
+
+        LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
+        PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
+
+        /* Load SHM pointer */
+
+        LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
+        MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *MapPtrIdx =
+            IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+
+        /* Update bitmap */
+
+        LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
+        Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+        Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+        IRB.CreateStore(Incr, MapPtrIdx)
+           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+        /* Set prev_loc to cur_loc >> 1 */
+
+        StoreInst *Store =
+            IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
+        Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+```
+
+这是对AFL中边覆盖率收集插桩的传统方法，如果了解AFL的插桩原理的话这部分就很容易理解
+
+在MAP_SIZE的大小范围内取一个随机数作为当前基本块的ID，然后将其转化一个IR中32位的常量（cur_loc）。
+
+之后获取上一个基本块的ID（PrevLoc），这个变量其实就是前面设置的__afl_prev_loc全局变量。同时创建一个元数据，将它命名为nosanitize，这步操作其实是在告诉sanitizer不要对此处的指令进行检测，因为插桩的代码本身就是注入的，这样是为了防止误报。最后对这个创建出来的PrevLoc对象进行0扩展，因为PrevLoc是用load指令加载的数据，它有可能是8位或者是16位的整数，为了方便后面的位运算，所以在这里要将其扩展至32位。
+
+后面接着加载之前创建SHM虚拟共享内存的所在地址，这里的操作与之前获取PrevLoc的操作类似。
+
+然后创建一个GEP指令，然后由异或指令PrevLoc与cur_loc进行异或，这个异或出来的值作为一条边的ID，同时作为bitmap中的索引，这就是AFL边覆盖率插桩的核心逻辑：
+
+```c++
+Value *MapPtrIdx = IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+```
+
+将前面获得的这个边的ID作为索引，在bitmap的对应位置上将其值+1
+
+```c++
+        Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+        IRB.CreateStore(Incr, MapPtrIdx)
+           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+//CreateStore将自增后的值在bitmap的对应索引地址上进行更新
+```
+
+最后将AFLPrevLoc（prev_loc）的值设置为cur_loc >> 1后就结束传统AFL的插桩逻辑：
+
+```c++
+        /* Set prev_loc to cur_loc >> 1 */
+
+        StoreInst *Store =
+            IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
+        Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+```
+
+下面就是aflgo独有的距离插桩逻辑了：
+
+```c++
+if (distance >= 0) {
+
+          ConstantInt *Distance =
+              ConstantInt::get(LargestType, (unsigned) distance);
+
+          /* Add distance to shm[MAPSIZE] */
+
+          Value *MapDistPtr = IRB.CreateBitCast(
+              IRB.CreateGEP(MapPtr, MapDistLoc), LargestType->getPointerTo());
+          LoadInst *MapDist = IRB.CreateLoad(MapDistPtr);
+          MapDist->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          Value *IncrDist = IRB.CreateAdd(MapDist, Distance);
+          IRB.CreateStore(IncrDist, MapDistPtr)
+              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          /* Increase count at shm[MAPSIZE + (4 or 8)] */
+
+          Value *MapCntPtr = IRB.CreateBitCast(
+              IRB.CreateGEP(MapPtr, MapCntLoc), LargestType->getPointerTo());
+          LoadInst *MapCnt = IRB.CreateLoad(MapCntPtr);
+          MapCnt->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          Value *IncrCnt = IRB.CreateAdd(MapCnt, One);
+          IRB.CreateStore(IncrCnt, MapCntPtr)
+              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+        }
+```
+
+最开始判断distance是否存在，只对到目标位置有距离的基本块进行操作。
+
+然后将前面获取到的distance转化为IR中的常量。
+设置MapDistPtr，这是虚拟共享内存shm中位于MAP_SIZE的指针，也就是shm[MAP_SIZE]，从这个地址上取出当前的总距离值，也就是MapDist
+
+将当前的总距离值加上该BB到目标位置的距离作为新的总距离值然后再将这个增加后的距离值写回shm[MAP_SIZE]
+
+之后设置了一个MapCntPtr的变量，它的值来自于MapCntLoc，这个变量是紧挨着shm的一个aflgo的附加字段，根据前面的定义，其实就是shm[MAP_SIZE + 8]的位置。后面的操作就是将这个位置上的值+1后写回原地址
+
+从意义上来说，这是一个对于距离累加次数的计数器。它由于模糊测试过程的对某条路径到达目标位置平均距离的计算，这个平均距离会影响对于种子的能量分配。
+
+## 收尾处理
+
+到这里这个aflgo-pass的内容差不多就结束了，剩下的部分就是一些pass所需要的特定操作以及一些运行信息的输出
+
+```c++
+  /* Say something nice. */
+
+  if (!is_aflgo_preprocessing && !be_quiet) {
+
+    if (!inst_blocks) WARNF("No instrumentation targets found.");
+    else OKF("Instrumented %u locations (%s mode, ratio %u%%, dist. ratio %u%%).",
+             inst_blocks,
+             getenv("AFL_HARDEN")
+             ? "hardened"
+             : ((getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN"))
+               ? "ASAN/MSAN" : "non-hardened"),
+             inst_ratio, dinst_ratio);
+
+  }
+```
+
+这里是像用户返回插桩过程的一些信息，比如插桩了多少个基本块，本次插桩的插桩率是多少等。
+
+接下来的就是llvm pass中的对于一个pass的注册机制：
+
+```c++
+static void registerAFLPass(const PassManagerBuilder &,
+                            legacy::PassManagerBase &PM) {
+
+  PM.add(new AFLCoverage());
+
+}
+
+
+static RegisterStandardPasses RegisterAFLPass(
+    PassManagerBuilder::EP_OptimizerLast, registerAFLPass);
+
+static RegisterStandardPasses RegisterAFLPass0(
+    PassManagerBuilder::EP_EnabledOnOptLevel0, registerAFLPass);
+```
+
+这些操作是pass中的必要注册操作，首先将AFLCoverage添加到passmanager中，然后再通过RegisterAFLPass注册这个pass
+
+这里可以看到注册了两次，但一个EP_OptimizerLast，一个是EP_EnabledOnOptLevel0，这是确保pass在不同的编译优化级别下都能运行。=
+
+## 
