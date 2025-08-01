@@ -134,7 +134,7 @@ fi
 next_step
 ```
 
-tips：注释里面虽然写的是构筑CG和CFG，但实际操作上是只有
+tips：注释里面虽然写的是构筑CG和CFG，但实际操作上是只有构筑CG
 
 这里首先遍历前面在binaries中获得的所以的bc文件的名称，对于每一个bc文件都使用opt（LLVM官方工具）来生成这个模块的CG。
 
@@ -2114,6 +2114,186 @@ static RegisterStandardPasses RegisterAFLPass0(
 
 这些操作是pass中的必要注册操作，首先将AFLCoverage添加到passmanager中，然后再通过RegisterAFLPass注册这个pass
 
-这里可以看到注册了两次，但一个EP_OptimizerLast，一个是EP_EnabledOnOptLevel0，这是确保pass在不同的编译优化级别下都能运行。=
+这里可以看到注册了两次，但一个EP_OptimizerLast，一个是EP_EnabledOnOptLevel0，这是确保pass在不同的编译优化级别下都能运行。
 
-## 
+# distance.py
+
+这个程序用于处理前面由pass生成的dot文件，生成出对应的CG和CFG，并计算出后续需要用到的基本块到目标位置距离。
+
+从这个函数的main函数入口来分析，首先它设置了一些脚本运行所需要的参数：
+
+```python
+  parser = argparse.ArgumentParser ()
+  parser.add_argument ('-d', '--dot', type=str, required=True, help="Path to dot-file representing the graph.")
+  parser.add_argument ('-t', '--targets', type=str, required=True, help="Path to file specifying Target nodes.")
+  parser.add_argument ('-o', '--out', type=str, required=True, help="Path to output file containing distance for each node.")
+  parser.add_argument ('-n', '--names', type=str, required=True, help="Path to file containing name for each node.")
+  parser.add_argument ('-c', '--cg_distance', type=str, help="Path to file containing call graph distance.")
+  parser.add_argument ('-s', '--cg_callsites', type=str, help="Path to file containing mapping between basic blocks and called functions.")
+
+  args = parser.parse_args ()
+```
+
+这几个参数的含义分别是：
+
+- 传入的dot文件的路径
+- 传入包含目标位置的文件的路径
+- 一个用于保存生成的每个节点（基本块）距离的路径
+- 保存所有节点名称文件路径
+- 保存CG中的距离文件的路劲
+- 保存基本块与调用函数间（若基本块中存在函数调用）对应关系的文件路径
+
+然后通过对传入的dot文件用networkx转化为图对象后，判断这个图中是否有“Call graph”字符串来决定是进入CG模式还是CFG模式。
+
+```python
+  print ("\nParsing %s .." % args.dot)
+  G = nx.DiGraph(nx.drawing.nx_pydot.read_dot(args.dot))
+  print (G)
+
+  is_cg = "Call graph" in str(G)
+  print ("\nWorking in %s mode.." % ("CG" if is_cg else "CFG"))
+```
+
+## CG中的距离计算
+
+如果是CG模式的话，首先读取通过-t参数传入的目标文件中的目标位值信息，将其然后将可以在图中通过标签找到的那些目标加入到一个列表中（前面分析过CG图中的节点标签就是函数名）
+
+```python
+    print ("Loading targets..")
+    with open(args.targets, "r") as f:
+      targets = []
+      for line in f.readlines ():
+        line = line.strip ()
+        for target in find_nodes(line):
+          targets.append (target)
+```
+
+如果在目标文件中没有目标实际存在于CG中，则直接返回：
+
+```python
+    if (not targets and is_cg):
+      print ("No targets available")
+      exit(0)
+```
+
+然后通过distance函数实际计算每个节点到目标位置的距离：
+
+```python
+  print ("Calculating distance..")
+  with open(args.out, "w") as out, open(args.names, "r") as f:
+    for line in f.readlines():
+      distance (line.strip())
+```
+
+## CFG中的距离计算
+
+首先定义了几个需要用到的变量：
+
+```
+  caller = ""
+  cg_distance = {}
+  bb_distance = {}
+```
+
+然后检查参数是否正确传入：
+
+```python
+
+    if args.cg_distance is None:
+      print ("Specify file containing CG-level distance (-c).")
+      exit(1)
+
+    elif args.cg_callsites is None:
+      print ("Specify file containing mapping between basic blocks and called functions (-s).")
+      exit(1)
+```
+
+如果在CFG模式下，有cg_distance cg_callsites参数没有传入的话则退出程序
+
+然后将传入的中cg_distance的函数名与其距离值映射为一个键值对：
+
+```python
+      with open(args.cg_distance, 'r') as f:
+        for l in f.readlines():
+          s = l.strip().split(",")
+          cg_distance[s[0]] = float(s[1])
+```
+
+对于函数间的调用，通过传入的cg_callsites中记录的调用关系，与前面记录的cg_distance中的函数间距离结合，构成基本块->调用函数的距离关系：
+
+首先检查遍历到的这个基本块存不存在于CFG之中，如果存在，则判断由这个基本块调用的函数存不存在于之前记录的cg_distance中（也就是它调用的函数与目标位置是否可达）。
+
+最后判断这个基本块的调用关系是不是调用了多个函数，如果是则保留调用的最小的那个距离值。
+
+```python
+      with open(args.cg_callsites, 'r') as f:
+        for l in f.readlines():
+          s = l.strip().split(",")
+          if find_nodes(s[0]):
+            if s[1] in cg_distance:
+              if s[0] in bb_distance:
+                if bb_distance[s[0]] > cg_distance[s[1]]:
+                  bb_distance[s[0]] = cg_distance[s[1]]
+              else:
+                bb_distance[s[0]] = cg_distance[s[1]]
+```
+
+判断传入的目标文件中的目标基本块是不是存在于CFG之中，如果存在，则在bb_distance中将目标基本块本身的距离设置为0：
+
+```python
+      print ("Adding target BBs (if any)..")
+      with open(args.targets, "r") as f:
+        for l in f.readlines ():
+          s = l.strip().split("/");
+          line = s[len(s) - 1]
+          if find_nodes(line):
+            bb_distance[line] = 0
+            print ("Added target BB %s!" % line)
+```
+
+## distance函数
+
+这个是具体进行距离计算的函数，也是aflgo中描述基本块及函数间距离的具体实现，但在distance.py中的调用其实只有一处：
+
+```
+distance (line.strip())
+```
+
+进入函数之后首先判断是不是CG模式且传入的name参数有没有存在于bb_distance（字典对象）的键当中。
+
+如果是CFG模式，且传入处理的BBname已经在bb_distance中被记录过，则将bb_distance中对应的BBname的距离乘10作为该BB到目标BB的距离写入距离文件中。
+
+```python
+  if not is_cg and name in bb_distance.keys():
+    out.write(name)
+    out.write(",")
+    out.write(str(10 * bb_distance[name]))
+    out.write("\n")
+    return
+```
+
+然后遍历当前图中与传入name匹配的节点，如果是CG模式，则尝试使用迪杰斯特拉算法找到当前节点到目标节点间的最小距离，距离转换为 `1 / (1 + dist)` 的形式，所有路径的值累加起来，最后求 **加权平均的倒数**，用作最终评估距离。
+
+```python
+  for n in find_nodes (name):
+    d = 0.0
+    i = 0
+
+    if is_cg:
+      for t in targets:
+        try:
+          shortest = nx.dijkstra_path_length (G, n, t)
+          d += 1.0 / (1.0 + shortest)
+          i += 1
+        except nx.NetworkXNoPath:
+          pass
+```
+
+如果是CFG模式，则遍历bb_distance中的键值对，对于存在于CFG中的节点，尝试使用迪杰斯特拉算法找到这个节点到目标节点间的最近距离，然后计算路径距离 `shortest`，同时加上 10 倍的函数距离（`bb_d`）作为“穿过调用路径”的惩罚项。
+
+这个计算公式大概就是：
+
+```
+d += 1 / (1 + 10 * bb_d + shortest_path_len)
+```
+
