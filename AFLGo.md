@@ -2154,6 +2154,8 @@ static RegisterStandardPasses RegisterAFLPass0(
   print ("\nWorking in %s mode.." % ("CG" if is_cg else "CFG"))
 ```
 
+**整个距离计算的逻辑大概是：首先是CG模式获得所有对目标函数（或者说基本块）具有可达性的函数以及其到目标位置的距离，然后对于每个函数的生成的CFG进行基本块节点的遍历，如果这个这个基本块中存在对前面找到的对目标位置具有可达性的函数调用，那么就可以认为这个基本块对目标位置是存在可达关系的，那么就会对这个基本块做一个距离计算并将这个基本块和这个计算出的距离进行记录**
+
 ## CG中的距离计算
 
 如果是CG模式的话，首先读取通过-t参数传入的目标文件中的目标位值信息，将其然后将可以在图中通过标签找到的那些目标加入到一个列表中（前面分析过CG图中的节点标签就是函数名）
@@ -2289,11 +2291,46 @@ distance (line.strip())
           pass
 ```
 
-如果是CFG模式，则遍历bb_distance中的键值对，对于存在于CFG中的节点，尝试使用迪杰斯特拉算法找到这个节点到目标节点间的最近距离，然后计算路径距离 `shortest`，同时加上 10 倍的函数距离（`bb_d`）作为“穿过调用路径”的惩罚项。
+如果是CFG模式，则遍历bb_distance中的键值对，对于存在于CFG中的节点，尝试使用迪杰斯特拉算法找到这个节点到目标节点间的最近距离，然后计算路径距离 `shortest`，同时加上 10 倍的函数距离（`bb_d`）作为“穿过调用路径”的惩罚项（也就是一个跨函数的距离的倍率提升）。
 
 这个计算公式大概就是：
 
 ```
 d += 1 / (1 + 10 * bb_d + shortest_path_len)
+```
+
+同时，如果在CFG中同一个可以到达目标位置的基本块（节点）多次出现，那么距离值就取所有这个节点到目标位置距离的平均值：
+
+```python
+      for t_name, bb_d in bb_distance.items():
+        di = 0.0
+        ii = 0
+        for t in find_nodes(t_name):
+          try:
+            shortest = nx.dijkstra_path_length(G, n, t)
+            di += 1.0 / (1.0 + 10 * bb_d + shortest)
+            ii += 1
+          except nx.NetworkXNoPath:
+            pass
+        if ii != 0:
+          d += di / ii
+          i += 1
+```
+
+对于一个CFG中，最后到达目标位置的距离只取所有这个CFG中所有基本块计算得到的距离的最小值：
+
+```python
+    if d != 0 and (distance == -1 or distance > i / d) :
+      distance = i / d
+```
+
+在完成计算后，将名称与距离的对应关系写入距离文件中保存：
+
+```python
+  if distance != -1:
+    out.write (name)
+    out.write (",")
+    out.write (str (distance))
+    out.write ("\n")
 ```
 
