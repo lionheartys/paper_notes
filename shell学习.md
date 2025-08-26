@@ -951,3 +951,220 @@ expr命令与$((  ))语法类似，都是进行算术运算，但是当前推荐
 
 前面有讲过，不多赘述
 
+# 操作历史
+
+bash会保存用户的操作历史
+
+当用户退出shell的时候，bash会默认把用户的操作历史保存在`~/.bash_history`文件，该文件默认储存500个操作。
+
+而环境变量HISTFILE就默认指向这个文件：
+
+```
+➜  echo $HISTFILE
+/home/youngmith/.zsh_history
+```
+
+## history命令
+
+history命令会输出所有的操作历史，也就是输出HHISTFILE文件的内容：
+
+相比直接读取`.bash_history`文件，它的优势在于所有命令之前加上了行号。最近的操作在最后面，行号最大。
+
+如果想搜索某个以前执行过的命令，则可以配合使用grep和less这种文本阅读相关的命令
+
+另外，下面这个命令：
+
+```
+history -c
+```
+
+可以直接清空所有的操作历史，也就是直接清空HISTFILE文件
+
+##  环境变量
+
+### HISTTIMEFORMAT
+
+通过定制这个环境变量：HISTTIMEFORMAT，可以让命令history的返回按照一定的时间格式显示：
+
+```
+$ export HISTTIMEFORMAT='%F %T  '
+$ history
+1  2013-06-09 10:40:12   cat /etc/issue
+2  2013-06-09 10:40:12   clear
+```
+
+上面代码中，`%F`相当于`%Y - %m - %d`（年-月-日），`%T`相当于`%H : %M : %S`（时:分:秒）。
+
+而在zsh中，定制操作历史的时间戳方法则不相同：
+
+```
+(base) # youngmith in ~ [16:17:27]
+➜  setopt EXTENDED_HISTORY
+(base) # youngmith in ~ [16:17:37]
+➜  alias history='fc -l -i %F %T'
+(base) # youngmith in ~ [16:18:22]
+➜  fc -l -i
+ 3225  2025-08-25 20:23  cd auto_harness
+ 3226  2025-08-25 20:23  ls
+ 3227  2025-08-26 16:02  /usr/bin/python3 /home/youngmith/.vscode-server/extensions/ms-python.python-2025.12.0-linux-x64/python_files/printEnvVariablesToFile.py /home/youngmith/.vscode-server/extensions/ms-python.python-2025.12.0-linux-x64/python_files/deactivate/zsh/envVars.txt
+ 3228  2025-08-26 16:02  docker
+ 3229  2025-08-26 16:04  echo $HISTFILE
+ 3230  2025-08-26 16:06  history | less
+ 3231  2025-08-26 16:12  export HISTTIMEFORMAT='%F %T  '
+ 3232  2025-08-26 16:13  history | less
+ 3233  2025-08-26 16:13  history
+ 3234  2025-08-26 16:13  echo $HISTTIMEFORMAT
+ 3235  2025-08-26 16:15  unset HISTTIMEFORMAT
+ 3236  2025-08-26 16:15  echo $HISTTIMEFORMAT
+ 3237  2025-08-26 16:17  celar
+ 3238  2025-08-26 16:17  clear
+ 3239  2025-08-26 16:17  setopt EXTENDED_HISTORY
+ 3240  2025-08-26 16:18  alias history='fc -l -i %F %T'
+```
+
+首先要通过 setopt EXTENDED_HISTORY开启时间戳记录，然后使用alias给fc命令挂一个别名为history（其实本质上history就是fc命令的一个别名）
+
+### HISTSIZE
+
+这个环境变量用于设置历史保存的最大数量：
+
+```
+$ export HISTSIZE=10000
+```
+
+上面这个命令就是设置操作历史的最大保留为10000
+
+那么，如果讲HISTSIZE设置为0，则是不需要保存此次操作的历史
+
+另外，如果在bashrc文件中将这个环境变量设置为0，则是不保存该用户的操作历史。如果写入`/etc/profile`，整个系统都不会保留操作历史。
+
+## ctrl r
+
+输入命令时按下ctrl r，就等于对`.bash_history`文件进行搜索，直接键入命令的开头部分，shell就会自动在该文件中反向查询（即查找最近的命令），然后按下回车即可执行这个命令
+
+## ！命令
+
+### !+行号
+
+操作历史的每一条记录都是有行号的。知道命令的行号可以直接使用`感叹号 + 行号`执行该命令：
+
+```
+$ !8
+```
+
+这就是执行`.bash_history`里面的第8条命令
+
+### !-数字
+
+如果想执行本次 Shell 对话中倒数的命令，比如执行倒数第3条命令，就可以输入`!-3`。
+
+### !!
+
+`!!`命令返回上一条命令。
+
+```
+(base) # youngmith in ~ [16:44:50]
+➜  !!
+(base) # youngmith in ~ [16:44:52]
+➜  ls
+```
+
+### !+搜索词
+
+`感叹号 + 搜索词`可以快速执行匹配的命令。
+
+注意，`感叹号 + 搜索词`语法只会匹配命令，不会匹配参数。
+
+```
+(base) # youngmith in ~ [16:45:20]
+➜  !c
+(base) # youngmith in ~ [16:46:38]
+➜  clear
+```
+
+由于!加搜索词会进行搜索，所以在有些字符串中使用！的话需要加上转义字符：
+
+```
+$ echo "I say:\"hello\!\""
+```
+
+上面这个命令中，如果去掉!前的那个\的话就会造成错误，bash会把!识别成一个查找字符
+
+### !? + 搜索词
+
+`!? + 搜索词`可以搜索命令的任意部分，包括参数部分。它跟`! + 搜索词`的主要区别是，后者是从行首开始匹配。
+
+另外，这个操作就可以匹配命令用到的参数部分了
+
+```
+➜  echo helloworld
+helloworld
+(base) # youngmith in ~ [16:50:09]
+➜  !?hello
+(base) # youngmith in ~ [16:50:15]
+➜  echo helloworld
+```
+
+### !$，!*
+
+`!$`代表上一个命令的最后一个参数，它的另一种写法是`$_`。
+
+`!*`代表上一个命令的所有参数，即除了命令以外的所有部分。
+
+```
+$ cp a.txt b.txt
+$ echo !$
+b.txt
+
+$ cp a.txt b.txt
+$ echo !*
+a.txt b.txt
+```
+
+如果想匹配上一个命令的某个指定位置的参数，使用`!:n`。比如!:2就是返回上一条命令的第二个参数
+
+如果想寻找比较久之前的某条命令的某个参数，可以使用下面这个语法：
+
+```
+!<命令>:n（指定位置的参数）和!<命令>:$（最后一个参数）。
+```
+
+### !:p
+
+如果只是想输出上一条命令，而不执行他，那么就使用：!:p
+
+```
+(base) # youngmith in ~ [17:16:32]
+➜  !:p
+(base) # youngmith in ~ [17:16:53]
+➜  cd ~
+```
+
+在zsh中，!! !:p 之间没有什么区别
+
+如果想输出最近一条匹配的命令，而不执行它，可以使用`!<命令>:p`
+
+```
+(base) # youngmith in ~ [17:16:53]
+➜  !su:p
+(base) # youngmith in ~ [17:18:37]
+➜  sudo chown -R youngmith:youngmith initramfs
+```
+
+这个例子中就是找到最近的su命令
+
+在开启histverify参数的情况下， !+搜索词和这个!:p的作用是一样的
+
+## histverify 参数
+
+上面的那些快捷命令（比如`!!`命令），都是找到匹配的命令后，直接执行。如果希望增加一个确认步骤，先输出是什么命令，让用户确认后再执行，可以打开 Shell 的`histverify`选项。
+
+打开`histverify`这个选项后，使用`!`快捷键所返回的命令，就会先输出，等到用户按下回车键后再执行。
+
+在zsh中，使用：
+
+```
+setopt | grep hist
+```
+
+来确定是否开启了这个选项
